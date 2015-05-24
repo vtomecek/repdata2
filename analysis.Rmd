@@ -1,0 +1,493 @@
+---
+title: "NOAA Storm Data Analysis"
+author: "Vladimír Tomeček"
+date: "Saturday, March 21, 2015"
+output: 
+    html_document: 
+        fig_caption: yes
+---
+
+# Synopsis
+In this report we will explore the U.S. National Oceanic and Atmospheric Administration's 
+(NOAA) storm database in order to find out:
+
+1. Which types of events are most harmful with respect to population health
+2. Which types of events have the greatest economic consequences
+
+First we will split the data into 49 Event Types according to `Storm Data Documentation`, 
+then we will manually check top values in each category in order to find corrupted data that
+may affect out analysis and finally we will summarize and visualize the data.
+
+Our analysis will show that tornadoes are top killers followed by heats.
+Most economic damage is caused by hurricanes, tornadoes and floods.
+Droughts did greatest damage on crops.
+
+
+# Data processing
+### Data
+Our data comes from 
+[U.S. National Oceanic and Atmospheric Administration's (NOAA) storm database](https://d396qusza40orc.cloudfront.net/repdata%2Fdata%2FStormData.csv.bz2).
+The database contains 902,297 observations of 37 variables from years 1950 to 2011.
+
+### Data loading
+We are only interesting in some variables (BGN_DATE, STATE, EVTYPE, FATALITIES,
+INJURIES, PROPDMG, PROPDMGEXP, CROPDMG, CROPDMGEXP), so to speed-up the loading process
+and to save some space I will load the data like this:
+
+```{r}
+data <- read.csv('repdata-data-StormData.csv.bz2',
+            colClasses = c(
+                # STATE__ - EVTYPE
+                'NULL', 'character', 'NULL', 'NULL', 'NULL', 'NULL', 'factor', 'factor', 
+                # BGN_RANGE - END_LOCATI
+                'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 
+                # LENGTH - MAG
+                'NULL', 'NULL', 'NULL', 'NULL', 
+                # FATALITIES - CROPDMGEXP
+                'numeric', 'numeric', 'numeric', 'factor', 'numeric', 'factor',
+                # WFO-REFNUM
+                'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL', 'NULL'
+            )
+        )
+```
+
+### Data transformation - damage costs
+Information about damage costs is split to two fields (damage, exponent), so we need to decode 
+this exponent and calculate total damage.
+
+```{r message=FALSE, warning=FALSE}
+## Replace K, M, B... with numerical values
+require(plyr)
+data$PROPDMGEXP <- as.integer(as.character (
+    revalue(data$PROPDMGEXP, c("H"="2", "h"=2, "K"=3, "k"=3, "M"=6, "m"=6, "B"=9))
+))
+data$CROPDMGEXP <- as.integer(as.character (
+    revalue(data$CROPDMGEXP, c("H"="2", "h"=2, "K"=3, "k"=3, "M"=6, "m"=6, "B"=9))
+))
+
+## Substitute NAs with 0s
+data$PROPDMGEXP[is.na(data$PROPDMGEXP)] <- 0
+data$CROPDMGEXP[is.na(data$CROPDMGEXP)] <- 0
+
+## Calculate total damage
+data$PROPDMG <- data$PROPDMG * 10^data$PROPDMGEXP
+data$CROPDMG <- data$CROPDMG * 10^data$CROPDMGEXP
+```
+
+### Data transformation - EVTYPE
+```{r}
+nrow(table(data$EVTYPE))
+```
+Our table shows 985 distinct types of events, we want to transform these events
+to match the `Storm Data Event Table` on page 6 of
+[Storm Data Documentation](https://d396qusza40orc.cloudfront.net/repdata%2Fpeer2_doc%2Fpd01016005curr.pdf),
+which consist of 48 events.
+
+First we create `EVTYPE` data frame consisting of all 985 distinct types.
+On this data frame, we will do all the pattern matching and substitution
+and when we will be ready we will update the `data` data frame in single pass.
+
+```{r}
+EVTYPE <- data.frame(stringsAsFactors = FALSE, oldname = names(table(data$EVTYPE)))
+# transform the old name little bit to facilitate the pattern matching
+# to uppercase & replace TSTM with THUNDERSTORM & left trim
+EVTYPE$tmp <- sub("^[[:space:]]+", "", 
+              sub("TSTM", "THUNDERSTORM", 
+              toupper(EVTYPE$oldname)
+              ))
+# place for new names
+EVTYPE$newname <- rep("", nrow(EVTYPE))
+```
+
+985 is quite a lot of records so we want to match most of these records automaticaly.
+We create `TARGET` data frame, containing target event table (ordered by length of string)
+and we run agrep (approximate grep) for each record in this table.
+
+```{r}
+TARGET <- data.frame(stringsAsFactors = FALSE, name = c(
+    "Astronomical Low Tide", "Avalanche", "Blizzard", "Coastal Flood",  "Cold/Wind Chill", 
+    "Debris Flow", "Dense Fog", "Dense Smoke", "Drought", "Dust Devil", "Dust Storm",
+    "Excessive Heat", "Extreme Cold/Wind Chill", "Flash Flood", "Flood", "Frost/Freeze", 
+    "Funnel Cloud", "Freezing Fog", "Hail", "Heat", "Heavy Rain", "Heavy Snow", "High Surf",
+    "High Wind", "Hurricane (Typhoon)", "Ice Storm", "Lake-Effect Snow", "Lakeshore Flood",
+    "Lightning", "Marine Hail", "Marine High Wind", "Marine Strong Wind", "Marine Thunderstorm Wind",
+    "Rip Current", "Seiche", "Sleet", "Storm Surge/Tide", "Strong Wind", "Thunderstorm Wind",
+    "Tornado", "Tropical Depression", "Tropical Storm", "Tsunami", "Volcanic Ash", "Waterspout", 
+    "Wildfire", "Winter Storm", "Winter Weather"))
+TARGET$length <- nchar(TARGET$name)
+TARGET <- TARGET[order(-TARGET$length),]
+
+for (pattern in TARGET$name) {
+    # match at the beginning of the string
+    ids <- grep(paste0("^", toupper(pattern)), EVTYPE$tmp)
+    EVTYPE$newname[ids] <- pattern
+    # or match anywhere, but new name should be empty yet
+    ids <- agrep(toupper(pattern), EVTYPE$tmp[EVTYPE$newname==""])
+    EVTYPE$newname[EVTYPE$newname==""][ids] <- pattern
+}
+
+## We can now view the result and decide what to do next
+#View(EVTYPE)
+```
+
+There is still a lot of records that cannot be matched automatically, plus our agrep introduced some errors
+so now we need to match the rest manually.
+
+```{r}
+# replace all records in EVTYPE data frame
+replace_all <- function(search, replace) {
+    EVTYPE$newname[grep(search, EVTYPE$tmp)] <<- replace
+}
+
+# replace only those records which have newname empty yet
+replace_empty <- function(search, replace) {
+    EVTYPE$newname[EVTYPE$newname==""][grep(search, EVTYPE$tmp[EVTYPE$newname==""])] <<- replace
+}
+
+EVTYPE$newname[agrep(toupper("Wind Chill"), EVTYPE$tmp)] <- "Cold/Wind Chill"
+EVTYPE$newname[agrep(toupper("Extreme Wind Chill"), EVTYPE$tmp)] <- "Extreme Cold/Wind Chill"
+replace_all("FLASH", "Flash Flood")
+replace_empty("DUST", "Dust Storm")
+replace_empty("^COASTAL", "Coastal Flood")
+replace_empty("COLD", "Cold/Wind Chill")
+replace_empty("DRY", "Drought")
+replace_empty("FREEZ", "Frost/Freeze")
+replace_empty("FROST", "Frost/Freeze")
+replace_empty("ICE", "Frost/Freeze")
+replace_empty("ICY", "Frost/Freeze")
+replace_empty("SNOW", "Winter Weather")
+replace_empty("PRECIP", "Heavy Rain")
+replace_empty("RAIN", "Heavy Rain")
+replace_empty("WARM", "Heat")
+replace_empty("WET", "Heavy Rain")
+replace_empty("HOT", "Heat")
+replace_empty("WIND", "Strong Wind")
+replace_empty("^WINT.*MIX$", "Winter Weather")
+replace_empty("WALL CLOUD", "Funnel Cloud")
+replace_all("^ASTRONOMICAL HIGH TIDE", "High Surf")
+replace_all("^BEACH EROS", "High Surf")
+replace_all("^BEACH FLOOD", "Coastal Flood")
+replace_all("^BELOW NORMAL", "Drought")
+replace_all("^BLIZZARD", "Blizzard")
+replace_all("^BLOW-OUT TIDE", "Astronomical Low Tide")
+replace_all("^BRUSH FIRE", "Wildfire")
+replace_all("^COASTAL EROSION", "Coastal Flood")
+replace_all("^COASTAL SURGE", "Storm Surge/Tide")
+replace_all("^COASTAL/TIDAL", "Storm Surge/Tide")
+replace_all("^COLD AIR FUNNEL", "Funnel Cloud")
+replace_all("^COLD WEATHER", "Cold/Wind Chill")
+replace_all("^COOL", "Cold/Wind Chill")
+replace_all("^CSTL FLOOD", "Coastal Flood")
+replace_all("^DAM FAIL", "")
+replace_all("^DOWNBURST", "Thunderstorm Wind")
+replace_all("^DRIEST", "Drought")
+replace_all("^DRY MICROBURST", "Thunderstorm Wind")
+replace_all("^DRY WEATHER", "Drought")
+replace_all("^EROSION", "Coastal Flood")
+replace_all("^EXCESSIVE [PR]", "Heavy Rain")
+replace_all("^EXCESSIVE WET", "")
+replace_all("^EXTENDED COLD", "Extreme Cold/Wind Chill")
+replace_all("^EXTREME COLD", "Extreme Cold/Wind Chill")
+replace_all("^EXTREME WIND", "Extreme Cold/Wind Chill")
+replace_all("^EXTREME HEAT", "Excessive Heat")
+replace_all("^FOG", "Dense Fog")
+replace_all("^FOG AND COLD", "Freezing Fog")
+replace_all("^FOREST FIRE", "Wildfire")
+replace_all("^FREEZING RAIN", "Winter Weather")
+replace_all("^FREEZING RAIN.*SLEET.*", "Sleet")
+replace_all("^FUNNEL", "Funnel Cloud")
+replace_all("^GLAZE", "Freezing Fog")
+replace_all("^GRADIENT WIND", "Tropical Depression")
+replace_all("^GRASS FIRE", "Wildfire")
+replace_all("^GUSTNADO", "Thunderstorm Wind")
+replace_all("^GUSTY WIND", "Strong Wind")
+replace_all("^HAZARDOUS SURF", "High Surf")
+replace_all("^HEAVY LAKE", "Lake-Effect Snow")
+replace_all("^HEAVY SHOWER", "Heavy Rain")
+replace_all("^HEAVY SEAS", "Coastal Flood")
+replace_all("^HEAVY SURF", "High Surf")
+replace_all("^HEAVY PRECIP", "Heavy Rain")
+replace_all("^HEAVY WET SNOW", "Heavy Snow")
+replace_all("^HEAVY SWELL", "High Surf")
+replace_all("^HIGH (\ ?SWELLS|TIDES|WAVES|SEAS|WATER)", "High Surf")
+replace_all("^HIGH TEMP", "Excessive Heat")
+replace_all("^HOT SPELL", "Heat")
+replace_all("^HURRICANE", "Hurricane (Typhoon)")
+replace_all("^HVY RAIN", "Heavy Rain")
+replace_all("^HYPER", "Excessive Heat")
+replace_all("^HYPO", "Extreme Cold/Wind Chill")
+replace_all("^ICE PELLETS", "Sleet")
+replace_all("^ICE FOG", "Freezing Fog")
+replace_all("^ICE STORM", "Ice Storm")
+replace_all("^LAKE FLOOD", "Lakeshore Flood")
+replace_all("^LOW TEMPERATURE", "Cold/Wind Chill")
+replace_all("^MICROBURST", "Thunderstorm Wind")
+replace_all("^MUD", "Debris Flow")
+replace_all("^LAND", "Debris Flow")
+replace_all("^RAIN", "Heavy Rain")
+replace_all("^RAPIDLY RISING", "Storm Surge/Tide")
+replace_all("^RECORD (\ ?COLD|COOL|LOW)", "Extreme Cold/Wind Chill")
+replace_all("^RECORD HEAT", "Excessive Heat")
+replace_all("^RECORD HIGH", "Excessive Heat")
+replace_all("^RECORD TEMP", "Excessive Heat")
+replace_all("^RECORD WARM", "Excessive Heat")
+replace_all("^RECORD LOW RAINFALL", "Drought")
+replace_all("^REMNANTS", "Hurricane (Typhoon)")
+replace_all("^ROCK SLIDE", "Debris Flow")
+replace_all("^ROUGH", "High Surf")
+replace_all("^RURAL FLOOD", "Heavy Rain")
+replace_all("^SEVERE THUNDER", "Thunderstorm Wind")
+replace_all("^SMALL STREAM", "Heavy Rain")
+replace_all("^SML STREAM", "Heavy Rain")
+replace_all("^SMOKE", "Dense Smoke")
+replace_all("^SOUTHEAST", "")
+replace_all("^STORM FORCE", "Tropical Storm")
+replace_all("^STORM SURGE", "Storm Surge/Tide")
+replace_all("^THUNDERSTORM", "Thunderstorm Wind")
+replace_all("^THUNDERSNOW", "Heavy Snow")
+replace_all("^TIDAL", "Storm Surge/Tide")
+replace_all("^TORNDAO", "Tornado")
+replace_all("^TYPHOON", "Hurricane (Typhoon)")
+replace_all("^UNSEASONA(L|BLY) (COOL|LOW)", "Cold/Wind Chill")
+replace_all("^URBAN", "Heavy Rain")
+replace_all("^VOG", "Volcanic Ash")
+replace_all("^VOLCANIC ER", "Volcanic Ash")
+replace_all("^WET MIC", "Thunderstorm Wind")
+replace_all("^WHIRLWIND", "Tornado")
+replace_all("^WILD", "Wildfire")
+replace_all("^WND", "Strong Wind")
+
+## Another check
+#View(EVTYPE)
+```
+
+Now it looks OK so we will close the data frame filling all remaining empty fields with `Other`.
+```{r}
+EVTYPE$newname[EVTYPE$newname==""] <- "Other"
+```
+
+Now we can create new EVTYPE in single pass (100+ passes on 1M records would be time consuming).
+```{r}
+## create new EVTYPE with 49 levels (48 types + 1 empty/other):
+data$EVTYPE2 <- mapvalues(data$EVTYPE, EVTYPE$oldname, EVTYPE$newname)
+```
+
+
+### Outlier analysis
+Now we will explore top contributors in each category and 
+we will compare the values with the data found on internet.
+There can be some errors in the data, we can't check them all,
+so at least we will check few top values, which can affect our results most.
+
+Top killer is Chicago heat wave, followed by tornadoes.
+```{r message=FALSE}
+require(xtable)
+sort(data$FATALITIES, dec=T)[1:20]
+```
+```{r results="asis"}
+# http://en.wikipedia.org/wiki/1995_Chicago_heat_wave
+# that's correct (Wikipedia states even more fatalities - ~750)
+print(xtable(data[which.max(data$FATALITIES),]), type="html")   # 583
+
+# http://en.wikipedia.org/wiki/2011_Joplin_tornado
+# correct
+print(xtable(data[data$FATALITIES==158,]), type="html")
+
+# http://en.wikipedia.org/wiki/1953_Flint%E2%80%93Beecher_tornado
+# correct
+print(xtable(data[data$FATALITIES==116,]), type="html")
+
+# http://en.wikipedia.org/wiki/1953_Waco_tornado_outbreak
+# correct - Wikipedia states 144 and same # of injuries, but other sorces states 114 killed
+print(xtable(data[data$FATALITIES==114,]), type="html")
+```
+
+Injuries category is dominated by tornadoes.
+```{r}
+sort(data$INJURIES, dec=T)[1:20]
+```
+```{r results="asis"}
+# http://en.wikipedia.org/wiki/1979_Red_River_Valley_tornado_outbreak
+# probably correct
+print(xtable(data[which.max(data$INJURIES),]), type="html")     # 1700
+
+# http://www.srh.noaa.gov/jan/?n=1994_deltaicestorm
+# probably correct
+print(xtable(data[data$INJURIES==1568,]), type="html")
+
+# http://en.wikipedia.org/wiki/1953_Worcester_tornado
+# probably correct
+print(xtable(data[data$INJURIES==1228,]), type="html")
+
+# http://en.wikipedia.org/wiki/Super_Outbreak
+# http://en.wikipedia.org/wiki/2011_Joplin_tornado
+# correct
+print(xtable(data[data$INJURIES==1150,]), type="html")
+```
+
+In property damage we found 1 error.
+First place should go to Katrina even if she splits into several records.
+```{r}
+sort(data$PROPDMG, dec=T)[1:20]
+```
+```{r results="asis"}
+# http://pubs.usgs.gov/of/2006/1182/pdf/ofr2006-1182.pdf
+# should be 300M - probably someone wrote B instead of M
+print(xtable(data[which.max(data$PROPDMG),]), type="html")      # 115e+9
+data[605953, 'PROPDMG'] <- data[605953, 'PROPDMG'] / 1000
+
+# this is Katrina-related event - shouldn't it be categorized as hurricane?
+# Katrina in Louisiana, second day
+# http://en.wikipedia.org/wiki/Hurricane_Katrina
+print(xtable(data[data$PROPDMG==31.3e+9,]), type="html")
+
+# Katrina in Louisiana, first day
+print(xtable(data[data$PROPDMG==16.93e+9,]), type="html")
+
+# Katrina in Mississippi, second day
+# again Storm Surge instead of Hurricane
+print(xtable(data[data$PROPDMG==11.26e+9,]), type="html")
+
+# http://en.wikipedia.org/wiki/Hurricane_Wilma
+# fatalities / damage are spread to multiple days again
+print(xtable(data[data$PROPDMG==10e+9,]), type="html")
+```
+
+And finally most diverse category - crop damage.
+```{r}
+sort(data$CROPDMG, dec=T)[1:20]
+```
+```{r results="asis"}
+# 1. http://en.wikipedia.org/wiki/Great_Flood_of_1993
+# 2. http://www.srh.noaa.gov/jan/?n=1994_deltaicestorm
+print(xtable(data[data$CROPDMG==5e+9,]), type="html")
+
+# Katrina in Mississippi, second day
+print(xtable(data[data$CROPDMG==1.51e+9,]), type="html")
+
+# Drought in Texas, it was in fact in May
+print(xtable(data[data$CROPDMG==1e+9,]), type="html")
+```
+
+### Data summarization
+Summary of all values.
+```{r message=FALSE}
+require(dplyr)
+summary <- 
+    data %>%
+    group_by(EVTYPE2) %>%
+    summarise(
+        FATALITIES = as.integer(sum(FATALITIES)),
+        INJURIES = as.integer(sum(INJURIES)),
+        PROPDMG = signif(sum(PROPDMG)/10^6, 4),
+        CROPDMG = signif(sum(CROPDMG)/10^6, 4)
+    )
+#View(summary)
+```
+
+This is for our Fatalities / Injuries figure.
+`summary_people` could be usefull if we wanted to plot dodge barplot, with fatalities + injuries,
+but there is a big difference between the two so I decided to plot them separatelly.
+I gave fatalities and injuries the same ordering so that data for the same event are together.
+```{r}
+summary_fatal <- 
+    data %>%
+    group_by(EVTYPE2) %>%
+    summarise(
+        sum = sum(FATALITIES)
+    )
+summary_injury <- 
+    data %>%
+    group_by(EVTYPE2) %>%
+    summarise(
+        sum = sum(INJURIES)
+    )
+summary_fatal$type <- 'FATALITIES'
+summary_injury$type <- 'INJURIES'
+summary_people <- rbind(summary_fatal, summary_injury)
+
+# order
+summary_fatal$EVTYPE2 <- reorder(summary_fatal$EVTYPE2, summary$FATALITIES)
+summary_injury$EVTYPE2 <- reorder(summary_injury$EVTYPE2, summary$FATALITIES)
+summary_people$EVTYPE2 <- reorder(summary_fatal$EVTYPE2, summary$FATALITIES)
+# select only top20
+summary_fatal <- summary_fatal[as.integer(summary_fatal$EVTYPE2)>29,]
+summary_injury <- summary_injury[as.integer(summary_injury$EVTYPE2)>29,]
+```
+    
+This is for our damage figure.
+```{r}
+summary_dmg1 <- 
+    data %>%
+    group_by(EVTYPE2) %>%
+    summarise(
+        sum = sum(PROPDMG)
+    )
+summary_dmg2 <- 
+    data %>%
+    group_by(EVTYPE2) %>%
+    summarise(
+        sum = sum(CROPDMG)
+    )
+summary_dmg1$type <- 'PROP'
+summary_dmg2$type <- 'CROP'
+summary_dmg <- rbind(summary_dmg1, summary_dmg2)
+
+# order
+summary_dmg$EVTYPE2 <- reorder(summary$EVTYPE2, summary$PROPDMG + summary$CROPDMG)
+# select top 20
+summary_dmg <- summary_dmg[as.integer(summary_dmg$EVTYPE2)>29,]
+```
+
+Order summary data
+```{r}
+# order the data frame
+summary$EVTYPE2 <- reorder(summary$EVTYPE2, 100000*summary$FATALITIES 
+                           +100*summary$INJURIES +summary$PROPDMG +summary$CROPDMG)
+summary <- summary[order(-as.integer(summary$EVTYPE2)),]
+```
+
+
+# Results
+
+```{r fig.cap="Figure 1 - Top 20 events in fatalities", message=FALSE, fig.width=10}
+require(ggplot2)  
+require(gridExtra)
+
+plot1 <- qplot(data = summary_fatal, x = EVTYPE2, y = sum) +
+    geom_bar(stat="identity") + coord_flip() +
+    scale_y_sqrt(breaks=c(50,200,500,1000,2000,4000,6000)) +
+    xlab('') + ylab('fatalities') +
+    ggtitle('Fatalities (sqrt scale)')
+    
+plot2 <- qplot(data = summary_injury, x = EVTYPE2, y = sum) +
+    geom_bar(stat="identity") + coord_flip() +
+    scale_y_sqrt(breaks=c(500,2000,5000,10000,90000)) +
+    xlab('') + ylab('injuries') +
+    ggtitle('Injuries (sqrt scale)')
+    
+grid.arrange(plot1, plot2, ncol=2)
+```
+
+As we can see tornadoes killed and injured far more people than any other weather event.
+More than 1/4 of excessive heats kills comes from 1995 Chicago heat wave.
+
+```{r fig.cap="Figure 2 - Top 20 events economic damage", fig.width=10}
+ggplot(data = summary_dmg, aes(x=EVTYPE2, y=sum, fill=type)) +
+    geom_bar(stat="identity", position="dodge") + coord_flip() +
+    scale_y_sqrt(breaks=c(0.2e+10, 0.5e+10, 1e+10, 2.5e+10, 5.0e+10, 7.5e+10)) +
+    xlab('') + ylab('total damage') +
+    ggtitle("Economic damage (sqrt scale)")
+```
+
+Economic damage was done mostly by hurricanes (above all Katrina) followed by tornadoes and floods.
+Storm surge/tide are also hurricane-related as we saw in Outlier analysis section.
+All those events caused mostly property damage.
+Most crop damage was caused by drought.
+
+```{r fig.cap="Figure 3 - All events, all values ordered by fatalities", results='asis'}
+require(xtable)
+print(xtable(summary), type = "html")
+```
+
+Total damage by all events, economic damage is in millions of USD.
